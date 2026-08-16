@@ -12,6 +12,9 @@ import { CONTRACT_ADDRESS, PULSEGRID_ABI } from "@/lib/contract";
 import { getOrCreateBurnerAccount } from "@/lib/burner";
 import { StatCard } from "@/components/StatCard";
 import { EventLog, CheckInLogRow } from "@/components/EventLog";
+import { PulseGridCanvas } from "@/components/PulseGridCanvas";
+
+const GRID_SIZE = 100;
 
 const publicClient = createPublicClient({
   chain: monadTestnet,
@@ -28,8 +31,18 @@ export default function Dashboard() {
   const [pending, setPending] = useState(false);
   const [pulse, setPulse] = useState(false);
   const [ready, setReady] = useState(false);
+  const [funding, setFunding] = useState(false);
+  const [fundError, setFundError] = useState<string | null>(null);
+  const [cellActivity, setCellActivity] = useState<number[]>(
+    () => new Array(GRID_SIZE).fill(0)
+  );
+  const [selectedCellId, setSelectedCellId] = useState<number | null>(null);
+  const [pendingCellId, setPendingCellId] = useState<number | null>(null);
+  const [flashCellId, setFlashCellId] = useState<number | null>(null);
 
   const pulseTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fundAttempted = useRef(false);
 
   // Set up burner wallet once, client-side only
   useEffect(() => {
@@ -59,6 +72,63 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, [address]);
 
+  // Auto-fund a fresh burner wallet with 0 balance, once.
+  useEffect(() => {
+    if (!ready || !address) return;
+    if (parseFloat(balance) > 0) return;
+    if (fundAttempted.current) return;
+    fundAttempted.current = true;
+
+    const fund = async () => {
+      setFunding(true);
+      setFundError(null);
+      try {
+        const res = await fetch("/api/fund", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ address }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Funding failed");
+        }
+        // Poll until the balance actually reflects on-chain.
+        for (let i = 0; i < 20; i++) {
+          const bal = await publicClient.getBalance({
+            address: address as `0x${string}`,
+          });
+          if (bal > BigInt(0)) {
+            setBalance(formatEther(bal));
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      } catch (e: any) {
+        console.error("Auto-fund failed:", e);
+        setFundError(e.message || "Funding failed");
+      } finally {
+        setFunding(false);
+      }
+    };
+    fund();
+  }, [ready, address, balance]);
+
+  // Seed cell activity from chain state once on load.
+  useEffect(() => {
+    const cellIds = Array.from({ length: GRID_SIZE }, (_, i) => BigInt(i));
+    publicClient
+      .readContract({
+        address: CONTRACT_ADDRESS,
+        abi: PULSEGRID_ABI,
+        functionName: "getCellStateBatch",
+        args: [cellIds],
+      })
+      .then((results: any) => {
+        setCellActivity(results.map((r: any) => Number(r.activeCheckIns)));
+      })
+      .catch((e) => console.warn("Failed to load initial cell activity:", e));
+  }, []);
+
   // Live event subscription
   useEffect(() => {
     const unwatch = publicClient.watchEvent({
@@ -80,6 +150,25 @@ export default function Dashboard() {
         });
         setTotalCheckIns((c) => c + logs.length);
 
+        setCellActivity((prev) => {
+          const next = [...prev];
+          for (const log of logs as any[]) {
+            const cellId = Number(log.args.cellId as bigint);
+            if (cellId >= 0 && cellId < GRID_SIZE) {
+              next[cellId] = (next[cellId] ?? 0) + 1;
+            }
+          }
+          return next;
+        });
+
+        const lastLog = logs[logs.length - 1] as any;
+        const lastCellId = Number(lastLog.args.cellId as bigint);
+        if (lastCellId >= 0 && lastCellId < GRID_SIZE) {
+          setFlashCellId(lastCellId);
+          if (flashTimeout.current) clearTimeout(flashTimeout.current);
+          flashTimeout.current = setTimeout(() => setFlashCellId(null), 400);
+        }
+
         setPulse(true);
         if (pulseTimeout.current) clearTimeout(pulseTimeout.current);
         pulseTimeout.current = setTimeout(() => setPulse(false), 300);
@@ -92,10 +181,12 @@ export default function Dashboard() {
     setUniqueCells(new Set(rows.map((r) => r.cellId)).size);
   }, [rows]);
 
-  const doCheckIn = useCallback(async () => {
+  const doCheckIn = useCallback(async (cellId: number) => {
     const account = getOrCreateBurnerAccount();
     if (!account) return;
     setPending(true);
+    setPendingCellId(cellId);
+    setSelectedCellId(cellId);
     const start = performance.now();
     try {
       const walletClient = createWalletClient({
@@ -103,12 +194,11 @@ export default function Dashboard() {
         chain: monadTestnet,
         transport: http(),
       });
-      const cellId = BigInt(Math.floor(Math.random() * 1000));
       const hash = await walletClient.writeContract({
         address: CONTRACT_ADDRESS,
         abi: PULSEGRID_ABI,
         functionName: "executeCheckIn",
-        args: [cellId],
+        args: [BigInt(cellId)],
       });
       await publicClient.waitForTransactionReceipt({ hash });
       setLastLatencyMs(Math.round(performance.now() - start));
@@ -117,6 +207,7 @@ export default function Dashboard() {
       alert("Check-in failed. Check console — likely cooldown or low balance.");
     } finally {
       setPending(false);
+      setPendingCellId(null);
     }
   }, []);
 
@@ -175,15 +266,35 @@ export default function Dashboard() {
             <div className="text-neutral-500 mt-1">
               Balance: <span className="text-neutral-300">{balance} MON</span>
             </div>
+            {funding && (
+              <div className="text-sky-400 mt-1 flex items-center gap-2">
+                <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-neutral-700 border-t-sky-400 animate-spin" />
+                Funding your wallet...
+              </div>
+            )}
+            {fundError && !funding && parseFloat(balance) === 0 && (
+              <div className="text-red-400 mt-1">
+                Auto-fund failed: {fundError}
+              </div>
+            )}
           </div>
-          <button
-            onClick={doCheckIn}
-            disabled={pending}
-            className="bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-black font-medium px-5 py-2.5 rounded-md"
-          >
-            {pending ? "Checking in..." : "Check In"}
-          </button>
+          <div className="text-xs text-neutral-500 font-mono">
+            {pending
+              ? "Checking in..."
+              : funding
+              ? "Funding..."
+              : "Click a cell below to check in"}
+          </div>
         </div>
+
+        <PulseGridCanvas
+          activity={cellActivity}
+          selectedCellId={selectedCellId}
+          pendingCellId={pendingCellId}
+          flashCellId={flashCellId}
+          onSelect={doCheckIn}
+          disabled={funding || parseFloat(balance) === 0}
+        />
 
         <div className="grid grid-cols-3 gap-4">
           <StatCard label="Total Check-Ins" value={totalCheckIns} />
